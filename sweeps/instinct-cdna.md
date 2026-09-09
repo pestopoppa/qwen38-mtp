@@ -78,3 +78,60 @@ are therefore honest speed measurements, not identical-output speed claims. The 
 measured server-side on our own harness reads roughly 13% higher, which is the expected direction
 for an end-to-end client instrument that counts per-token delivery. Cross-instrument comparisons of
 speculative decoding should not be made without stating which instrument produced them.
+
+#### Concurrency: how the second drafting path scales past one slot
+*added 2026-09-09 by [@pestopoppa](https://github.com/pestopoppa)*
+
+Everything above is `--parallel 1`, which is what the community table measures. This section
+answers a different question that the table has no column for: **what happens to speculative
+decoding on this card when several users share the slot pool.** It is context, not a table row —
+different instrument, different drafter, different kernel tip from the section above. Read the
+comparability notes before quoting any of it.
+
+Same MI210 64 GB (gfx90a, ROCm 6.2), same unsloth `Qwen3.8-27B-Q8_0.gguf`, DFlash drafter
+(`--spec-type draft-dflash --spec-draft-n-max 8`, resident draft model 2,056,414,752 B), f16 K/V,
+`-ngl 99`, `-fa on`, `-b/-ub 2048`, `-t 8`, greedy sampling, 384 predicted tokens. **Only `-np` is
+varied**; every other flag is byte-identical across the four points. Three separate server
+launches per point (not three requests against one server), median of launches reported, GPU
+residency verified during each run, sclk pinned at 1700 MHz.
+
+| slots (`-np`) | aggregate tok/s | per slot | p95 dev over 3 launches | per-launch | peak VRAM |
+|---:|---:|---:|---:|---|---:|
+| 1 | **79.2** | 79.2 | 0.44% | 79.2, 79.2, 79.6 | 33.1 GiB |
+| 2 | 109.4 | 54.7 | 1.60% | 109.4, 108.9, 111.2 | 34.5 GiB |
+| 4 | 167.8 | 41.9 | 3.33% | 167.8, 162.2, 169.7 | 37.7 GiB |
+| 8 | **179.1** | 22.4 | 1.82% | 182.4, 178.2, 179.1 | 43.1 GiB |
+
+**The curve turns over hard between 4 and 8 slots.** Going from 4 to 8 buys +6.8% aggregate
+throughput and costs each user nearly half their rate (41.9 → 22.4 tok/s). `-np 4` is the
+operating point on this card: 93.7% of peak aggregate while every user still sees ~42 tok/s. If
+you are sizing a shared server around speculative decoding, the useful number is not peak
+aggregate — it is the last slot count before the per-user rate collapses, and here that is 4.
+
+**Dispersion grows with concurrency, so the spread is part of the result.** p95 deviation across
+launches runs 0.44% at `-np 1` and 3.33% at `-np 4` — a 7.5x widening. A single reading at `-np 4`
+is far less trustworthy than a single reading at `-np 1`, which is why the per-launch column is
+here. Anyone A/B-ing a change at concurrency needs to state their launch count; we would not act
+on fewer than three. (At `-np 8` the clock left its pin briefly, 1695–1700 MHz, on one launch.)
+
+**Comparability — three reasons these numbers do not line up with the tables above.**
+
+1. **Different instrument.** These are server-side aggregate rates from our own harness, not
+   client-side `probe.py` streaming numbers. The instrument note at the end of the previous
+   section measured that gap at roughly 13% in this direction on the same arm. The `-np 1` figure
+   here is therefore *not* an update to the 61.1 DFlash number above.
+2. **Different kernel tip.** The section above is champion `9e18beb0`; this sweep is
+   `ef81196d5bdd4190b46dff4ae7eecc333a46c8ce`, a later tip with more folded in. Unlike the earlier
+   tip, this one is public and rebuildable —
+   [`pestopoppa/llama.cpp`](https://github.com/pestopoppa/llama.cpp), branch
+   `ak/champion/llama-cpp-0db32c06e3e5` — so rule 6 still applies (not stock upstream), but the
+   build is no longer a black box.
+3. **Different drafter.** This is the DFlash block drafter with its own draft model, not the MTP
+   head this repo is about. **No MTP concurrency sweep exists on this hardware**, so nothing here
+   should be read as a statement about what `-np` does to MTP self-drafting. That sweep would be
+   worth having and we have not run it.
+
+**The greedy-divergence caveat from the previous section applies unchanged**: a greedy-vs-baseline
+divergence exists in the shared speculative verify path on this platform, affects all speculation
+modes, and is under investigation. These are honest speed measurements, not identical-output
+speed claims.
